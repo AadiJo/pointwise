@@ -1,0 +1,512 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Pointwise lab</title>
+<style>
+  :root {
+    --ink: #1d2a3a;
+    --muted: #64748b;
+    --accent: #2563eb;
+    --accent-soft: #dbeafe;
+    --marker: #dc2626;
+    --card: #ffffff;
+    --paper: #fbfaf6;
+    --grid: #e7e3d8;
+  }
+  html, body { margin: 0; height: 100%; background: transparent; }
+  body {
+    font: 13px/1.35 ui-rounded, "SF Pro Rounded", -apple-system, sans-serif;
+    color: var(--ink);
+    display: flex; flex-direction: column;
+    padding: 6px 14px 12px; box-sizing: border-box; gap: 8px;
+    -webkit-user-select: none; user-select: none;
+  }
+  #stage { position: relative; flex: 1 1 auto; min-height: 0; border-radius: 12px; overflow: hidden; background: var(--paper); box-shadow: inset 0 0 0 1px #ece8dc; }
+  canvas { display: block; width: 100%; height: 100%; }
+  #readouts { display: flex; gap: 8px; flex-wrap: wrap; }
+  .readout { background: var(--accent-soft); color: #1e3a8a; border-radius: 8px; padding: 4px 9px; font-weight: 650; font-variant-numeric: tabular-nums; }
+  .readout span { font-weight: 500; color: #1e40af; opacity: 0.8; margin-right: 4px; }
+  .readout.alert { background: #fee2e2; color: #991b1b; }
+  #controls { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 14px; }
+  .control { border-radius: 9px; padding: 4px 8px 2px; transition: background 0.3s, box-shadow 0.3s; }
+  .control.changing { background: #fff7d6; box-shadow: 0 0 0 2px #facc15; }
+  .control label { display: flex; justify-content: space-between; font-weight: 600; font-size: 12.5px; }
+  .control label b { color: var(--accent); font-variant-numeric: tabular-nums; }
+  input[type=range] { -webkit-appearance: none; appearance: none; width: 100%; height: 22px; background: transparent; margin: 0; }
+  input[type=range]::-webkit-slider-runnable-track { height: 5px; border-radius: 3px; background: linear-gradient(to right, var(--accent) var(--fill, 50%), #dfe5ef var(--fill, 50%)); }
+  input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 17px; height: 17px; margin-top: -6px; border-radius: 50%; background: #fff; border: 2px solid var(--accent); box-shadow: 0 1px 3px rgba(0,0,0,0.25); }
+  #live { position: absolute; top: 8px; right: 10px; font-size: 10.5px; font-weight: 700; letter-spacing: 0.06em; color: #15803d; background: #dcfce7; padding: 2px 7px; border-radius: 6px; }
+  #live::before { content: ""; display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #22c55e; margin-right: 5px; vertical-align: 1px; animation: blink 1.2s infinite; }
+  @keyframes blink { 50% { opacity: 0.2; } }
+  #formula { position: absolute; left: 10px; bottom: 8px; font: italic 600 13px "Iowan Old Style", Georgia, serif; color: #475569; background: rgba(255,255,255,0.8); padding: 2px 8px; border-radius: 6px; }
+</style>
+</head>
+<body>
+  <div id="stage"><canvas id="canvas"></canvas><div id="live">LIVE</div><div id="formula"></div></div>
+  <div id="readouts"></div>
+  <div id="controls"></div>
+<script>
+"use strict";
+const config = __SIM_CONFIG__;
+const canvas = document.getElementById("canvas");
+const context = canvas.getContext("2d");
+const controlsElement = document.getElementById("controls");
+const readoutsElement = document.getElementById("readouts");
+const formulaElement = document.getElementById("formula");
+let width = 0, height = 0;
+
+function resizeCanvas() {
+  const scale = window.devicePixelRatio || 2;
+  const rect = canvas.getBoundingClientRect();
+  width = rect.width; height = rect.height;
+  canvas.width = Math.round(width * scale); canvas.height = Math.round(height * scale);
+  context.setTransform(scale, 0, 0, scale, 0, 0);
+}
+
+// ---------- Parameters and sliders ----------
+
+const values = {};
+const definitions = {};
+const sliders = {};
+let onValuesChanged = () => {};
+
+function format(name, value) {
+  const definition = definitions[name];
+  const decimals = definition.decimals ?? (definition.step < 0.1 ? 2 : definition.step < 1 ? 1 : 0);
+  return value.toFixed(decimals) + (definition.unit ? " " + definition.unit : "");
+}
+
+function addControl(name, definition) {
+  definitions[name] = definition;
+  const requested = config.params && typeof config.params[name] === "number" ? config.params[name] : definition.value;
+  values[name] = Math.min(definition.max, Math.max(definition.min, requested));
+  const wrapper = document.createElement("div");
+  wrapper.className = "control";
+  wrapper.innerHTML = `<label>${definition.label}<b></b></label><input type="range" min="${definition.min}" max="${definition.max}" step="${definition.step}">`;
+  const input = wrapper.querySelector("input");
+  const valueLabel = wrapper.querySelector("b");
+  input.value = values[name];
+  const refresh = () => {
+    valueLabel.textContent = format(name, values[name]);
+    input.style.setProperty("--fill", ((values[name] - definition.min) / (definition.max - definition.min) * 100) + "%");
+  };
+  input.addEventListener("input", () => { values[name] = Number(input.value); refresh(); onValuesChanged([name]); });
+  sliders[name] = { input, wrapper, refresh };
+  refresh();
+  controlsElement.appendChild(wrapper);
+}
+
+// Slider moves in progress, advanced by the main tick below.
+const sliderMoves = {};
+function advanceSliderMoves(now) {
+  for (const name of Object.keys(sliderMoves)) {
+    const move = sliderMoves[name];
+    const progress = Math.min(1, (now - move.startedAt) / move.duration);
+    const eased = progress < 0.5 ? 2 * progress * progress : 1 - Math.pow(-2 * progress + 2, 2) / 2;
+    values[name] = move.from + (move.to - move.from) * eased;
+    sliders[name].input.value = values[name];
+    sliders[name].refresh();
+    onValuesChanged([name], progress < 1);
+    if (progress >= 1) {
+      delete sliderMoves[name];
+      setTimeout(() => sliders[name].wrapper.classList.remove("changing"), 1400);
+    }
+  }
+}
+
+window.pointwiseSim = {
+  /** Moves sliders smoothly to new values, highlighting each one, like a teacher turning a knob. */
+  set(newValues) {
+    const changedNames = Object.keys(newValues).filter((name) => sliders[name] && typeof newValues[name] === "number");
+    for (const name of changedNames) {
+      const definition = definitions[name];
+      sliders[name].wrapper.classList.add("changing");
+      sliderMoves[name] = { from: values[name], to: Math.min(definition.max, Math.max(definition.min, newValues[name])), startedAt: performance.now(), duration: 1100 };
+    }
+    return changedNames.length;
+  },
+  get() { return { ...values }; },
+};
+
+function setReadouts(items) {
+  readoutsElement.innerHTML = items.map((item) => `<div class="readout${item.alert ? " alert" : ""}"><span>${item.label}</span>${item.value}</div>`).join("");
+}
+
+// ---------- Drawing helpers ----------
+
+function clear() {
+  context.clearRect(0, 0, width, height);
+  context.strokeStyle = "#ede9de"; context.lineWidth = 1;
+  for (let x = 0; x < width; x += 24) { context.beginPath(); context.moveTo(x + 0.5, 0); context.lineTo(x + 0.5, height); context.stroke(); }
+  for (let y = 0; y < height; y += 24) { context.beginPath(); context.moveTo(0, y + 0.5); context.lineTo(width, y + 0.5); context.stroke(); }
+}
+function circle(x, y, radius, fill, stroke) {
+  context.beginPath(); context.arc(x, y, radius, 0, Math.PI * 2);
+  if (fill) { context.fillStyle = fill; context.fill(); }
+  if (stroke) { context.strokeStyle = stroke; context.lineWidth = 2; context.stroke(); }
+}
+function label(text, x, y, color = "#334155", align = "center", font = "600 12px ui-rounded, -apple-system") {
+  context.font = font; context.fillStyle = color; context.textAlign = align; context.fillText(text, x, y);
+}
+function arrowLine(x1, y1, x2, y2, color) {
+  context.strokeStyle = color; context.fillStyle = color; context.lineWidth = 2;
+  context.beginPath(); context.moveTo(x1, y1); context.lineTo(x2, y2); context.stroke();
+  const angle = Math.atan2(y2 - y1, x2 - x1);
+  context.beginPath(); context.moveTo(x2, y2);
+  context.lineTo(x2 - 8 * Math.cos(angle - 0.4), y2 - 8 * Math.sin(angle - 0.4));
+  context.lineTo(x2 - 8 * Math.cos(angle + 0.4), y2 - 8 * Math.sin(angle + 0.4));
+  context.closePath(); context.fill();
+}
+
+// ---------- Simulations ----------
+
+const simulations = {};
+
+simulations.pendulum = () => {
+  addControl("length", { label: "String length", min: 0.2, max: 3, step: 0.05, value: 1, unit: "m", decimals: 2 });
+  addControl("gravity", { label: "Gravity", min: 1, max: 25, step: 0.1, value: 9.8, unit: "m/s²", decimals: 1 });
+  addControl("angle", { label: "Release angle", min: 5, max: 80, step: 1, value: 25, unit: "°" });
+  addControl("mass", { label: "Bob mass", min: 0.1, max: 10, step: 0.1, value: 1, unit: "kg", decimals: 1 });
+  formulaElement.textContent = "T = 2π √(L / g)";
+  let theta = values.angle * Math.PI / 180, omega = 0, time = 0;
+  let lastCrossing = null, measuredPeriod = null, previousTheta = theta;
+  const trail = [];
+  onValuesChanged = (names, stillMoving) => {
+    if (names.includes("angle") || names.includes("length") || names.includes("gravity")) {
+      if (names.includes("angle")) { theta = values.angle * Math.PI / 180; omega = 0; }
+      measuredPeriod = null; lastCrossing = null; trail.length = 0;
+    }
+  };
+  return (dt) => {
+    const substeps = 8;
+    for (let i = 0; i < substeps; i++) {
+      const h = dt / substeps;
+      omega += -(values.gravity / values.length) * Math.sin(theta) * h;
+      theta += omega * h;
+      time += h;
+      if (previousTheta < 0 && theta >= 0) {
+        if (lastCrossing !== null) measuredPeriod = time - lastCrossing;
+        lastCrossing = time;
+      }
+      previousTheta = theta;
+    }
+    clear();
+    const pixelsPerMeter = (height - 48) / 3;
+    const pivotX = width / 2, pivotY = 18;
+    const bobX = pivotX + Math.sin(theta) * values.length * pixelsPerMeter;
+    const bobY = pivotY + Math.cos(theta) * values.length * pixelsPerMeter;
+    trail.push([bobX, bobY]); if (trail.length > 70) trail.shift();
+    context.fillStyle = "#94a3b8"; context.fillRect(pivotX - 60, pivotY - 8, 120, 6);
+    context.setLineDash([4, 5]); context.strokeStyle = "#cbd5e1"; context.lineWidth = 1.5;
+    context.beginPath(); context.moveTo(pivotX, pivotY); context.lineTo(pivotX, pivotY + values.length * pixelsPerMeter + 20); context.stroke();
+    context.setLineDash([]);
+    trail.forEach(([x, y], index) => circle(x, y, 2.2, `rgba(37,99,235,${index / trail.length * 0.5})`));
+    context.strokeStyle = "#334155"; context.lineWidth = 2;
+    context.beginPath(); context.moveTo(pivotX, pivotY); context.lineTo(bobX, bobY); context.stroke();
+    const bobRadius = 9 + Math.cbrt(values.mass) * 6;
+    const gradient = context.createRadialGradient(bobX - bobRadius / 3, bobY - bobRadius / 3, 2, bobX, bobY, bobRadius);
+    gradient.addColorStop(0, "#fca5a5"); gradient.addColorStop(1, "#dc2626");
+    circle(bobX, bobY, bobRadius, gradient);
+    const theoreticalPeriod = 2 * Math.PI * Math.sqrt(values.length / values.gravity);
+    setReadouts([
+      { label: "Period (measured)", value: measuredPeriod ? measuredPeriod.toFixed(2) + " s" : "…" },
+      { label: "Formula", value: theoreticalPeriod.toFixed(2) + " s" },
+      { label: "Swings per minute", value: (60 / theoreticalPeriod).toFixed(0) },
+    ]);
+  };
+};
+
+simulations.projectile = () => {
+  addControl("speed", { label: "Launch speed", min: 5, max: 40, step: 0.5, value: 20, unit: "m/s", decimals: 1 });
+  addControl("angle", { label: "Launch angle", min: 5, max: 85, step: 1, value: 45, unit: "°" });
+  addControl("gravity", { label: "Gravity", min: 1, max: 25, step: 0.1, value: 9.8, unit: "m/s²", decimals: 1 });
+  addControl("height", { label: "Launch height", min: 0, max: 20, step: 0.5, value: 0, unit: "m", decimals: 1 });
+  formulaElement.textContent = "x = v cos θ · t,   y = h + v sin θ · t − ½ g t²";
+  const ghostPaths = [];
+  let flight = null;
+  const solve = () => {
+    const radians = values.angle * Math.PI / 180;
+    const vx = values.speed * Math.cos(radians), vy = values.speed * Math.sin(radians);
+    const flightTime = (vy + Math.sqrt(vy * vy + 2 * values.gravity * values.height)) / values.gravity;
+    return { vx, vy, flightTime, range: vx * flightTime, peak: values.height + vy * vy / (2 * values.gravity), startedAt: performance.now(), path: [] };
+  };
+  let pendingRelaunch = null;
+  onValuesChanged = (names, stillMoving) => {
+    clearTimeout(pendingRelaunch);
+    pendingRelaunch = setTimeout(() => {
+      if (flight && flight.path.length > 2) { ghostPaths.push(flight.path); if (ghostPaths.length > 3) ghostPaths.shift(); }
+      flight = solve();
+    }, stillMoving ? 400 : 120);
+  };
+  flight = solve();
+  return () => {
+    clear();
+    const worldWidth = Math.max(10, ...ghostPaths.map((p) => p[p.length - 1][0]), flight.range) * 1.12;
+    const worldHeight = Math.max(6, ...ghostPaths.map((p) => Math.max(...p.map((q) => q[1]))), flight.peak) * 1.2;
+    const scale = Math.min((width - 50) / worldWidth, (height - 40) / worldHeight);
+    const originX = 30, originY = height - 22;
+    const toScreen = ([x, y]) => [originX + x * scale, originY - y * scale];
+    context.fillStyle = "#86efac"; context.fillRect(0, originY, width, height - originY);
+    context.fillStyle = "#94a3b8"; context.fillRect(originX - 10, originY - values.height * scale, 14, values.height * scale);
+    ghostPaths.forEach((path, index) => {
+      context.strokeStyle = `rgba(100,116,139,${0.25 + index * 0.12})`; context.lineWidth = 2; context.setLineDash([5, 5]);
+      context.beginPath(); path.forEach((point, i) => { const [x, y] = toScreen(point); i ? context.lineTo(x, y) : context.moveTo(x, y); }); context.stroke();
+      context.setLineDash([]);
+    });
+    const elapsed = Math.min(flight.flightTime, (performance.now() - flight.startedAt) / 1000 * 1.0);
+    const position = [flight.vx * elapsed, values.height + flight.vy * elapsed - 0.5 * values.gravity * elapsed * elapsed];
+    if (flight.path.length === 0 || elapsed > flight.path.length * 0.02) flight.path.push(position);
+    context.strokeStyle = "#2563eb"; context.lineWidth = 2.5;
+    context.beginPath(); flight.path.forEach((point, i) => { const [x, y] = toScreen(point); i ? context.lineTo(x, y) : context.moveTo(x, y); }); context.stroke();
+    const [ballX, ballY] = toScreen(position);
+    circle(ballX, ballY, 7, "#dc2626");
+    if (elapsed < flight.flightTime) {
+      const vyNow = flight.vy - values.gravity * elapsed;
+      arrowLine(ballX, ballY, ballX + flight.vx * 1.6, ballY, "#16a34a");
+      arrowLine(ballX, ballY, ballX, ballY - vyNow * 1.6, "#f59e0b");
+    } else {
+      const [peakX, peakY] = toScreen([flight.vx * flight.vy / values.gravity, flight.peak]);
+      label("▼ peak", peakX, peakY - 6, "#475569");
+      const [landX] = toScreen([flight.range, 0]);
+      label(flight.range.toFixed(1) + " m", landX, originY + 15, "#1e3a8a");
+      if (performance.now() - flight.startedAt > (flight.flightTime + 2.5) * 1000) { flight = solve(); }
+    }
+    setReadouts([
+      { label: "Range", value: flight.range.toFixed(1) + " m" },
+      { label: "Peak height", value: flight.peak.toFixed(1) + " m" },
+      { label: "Time in air", value: flight.flightTime.toFixed(2) + " s" },
+    ]);
+  };
+};
+
+simulations.wave = () => {
+  addControl("amplitude", { label: "Amplitude", min: 0.1, max: 2, step: 0.05, value: 1, unit: "m", decimals: 2 });
+  addControl("wavelength", { label: "Wavelength", min: 0.5, max: 6, step: 0.1, value: 3, unit: "m", decimals: 1 });
+  addControl("frequency", { label: "Frequency", min: 0.2, max: 3, step: 0.05, value: 0.8, unit: "Hz", decimals: 2 });
+  formulaElement.textContent = "v = f · λ";
+  let phaseTime = 0;
+  return (dt) => {
+    phaseTime += dt;
+    clear();
+    const metersAcross = 10, pixelsPerMeter = width / metersAcross, amplitudeScale = (height / 2 - 30) / 2;
+    const middleY = height / 2;
+    context.strokeStyle = "#cbd5e1"; context.setLineDash([4, 4]);
+    context.beginPath(); context.moveTo(0, middleY); context.lineTo(width, middleY); context.stroke(); context.setLineDash([]);
+    const waveY = (x) => middleY - values.amplitude * amplitudeScale * Math.sin(2 * Math.PI * (x / values.wavelength - values.frequency * phaseTime));
+    context.strokeStyle = "#2563eb"; context.lineWidth = 3;
+    context.beginPath();
+    for (let px = 0; px <= width; px += 2) { const y = waveY(px / pixelsPerMeter); px ? context.lineTo(px, y) : context.moveTo(px, y); }
+    context.stroke();
+    for (let meter = 0.5; meter < metersAcross; meter += 1) circle(meter * pixelsPerMeter, waveY(meter), 3, "#93c5fd");
+    const markerX = 2 * pixelsPerMeter;
+    circle(markerX, waveY(2), 7, "#dc2626");
+    // Bracket one wavelength between two crests.
+    const crestPhase = values.frequency * phaseTime + 0.25;
+    let crestMeters = ((crestPhase % 1) + 1) % 1 * values.wavelength;
+    while (crestMeters < 1) crestMeters += values.wavelength;
+    if (crestMeters + values.wavelength < metersAcross) {
+      const startX = crestMeters * pixelsPerMeter, endX = (crestMeters + values.wavelength) * pixelsPerMeter;
+      const bracketY = middleY - values.amplitude * amplitudeScale - 14;
+      context.strokeStyle = "#7c3aed"; context.lineWidth = 1.5;
+      context.beginPath(); context.moveTo(startX, bracketY + 6); context.lineTo(startX, bracketY); context.lineTo(endX, bracketY); context.lineTo(endX, bracketY + 6); context.stroke();
+      label("λ = " + values.wavelength.toFixed(1) + " m", (startX + endX) / 2, bracketY - 5, "#6d28d9");
+    }
+    setReadouts([
+      { label: "Wave speed", value: (values.frequency * values.wavelength).toFixed(2) + " m/s" },
+      { label: "Period", value: (1 / values.frequency).toFixed(2) + " s" },
+      { label: "Red dot", value: "moves up and down only" },
+    ]);
+  };
+};
+
+simulations.graph = () => {
+  const expressionText = (config.expression || "a*x^2 + b*x + c").trim();
+  const usedParameters = ["a", "b", "c", "d"].filter((name) => new RegExp("\\b" + name + "\\b").test(expressionText));
+  const defaults = { a: 1, b: 0, c: 0, d: 0 };
+  for (const name of usedParameters) addControl(name, { label: name, min: -10, max: 10, step: 0.1, value: defaults[name], decimals: 1 });
+  const source = expressionText.replace(/\^/g, "**").replace(/(\d)\s*([a-dx(])/g, "$1*$2").replace(/\b(sin|cos|tan|sqrt|abs|exp|log|PI)\b/g, "Math.$1").replace(/\bpi\b/g, "Math.PI");
+  let evaluate;
+  try { evaluate = new Function("x", "a", "b", "c", "d", `"use strict"; return (${source});`); } catch (error) { evaluate = () => NaN; }
+  formulaElement.textContent = "y = " + expressionText;
+  const f = (x) => { const y = evaluate(x, values.a ?? 0, values.b ?? 0, values.c ?? 0, values.d ?? 0); return Number.isFinite(y) ? y : NaN; };
+  return () => {
+    clear();
+    const range = 10, scale = Math.min(width, height) / (2 * range) * 0.95;
+    const centerX = width / 2, centerY = height / 2;
+    const toScreen = (x, y) => [centerX + x * scale, centerY - y * scale];
+    context.strokeStyle = "#94a3b8"; context.lineWidth = 1.5;
+    context.beginPath(); context.moveTo(0, centerY); context.lineTo(width, centerY); context.moveTo(centerX, 0); context.lineTo(centerX, height); context.stroke();
+    for (let tick = -range; tick <= range; tick += 2) {
+      if (!tick) continue;
+      const [tx] = toScreen(tick, 0); const [, ty] = toScreen(0, tick);
+      label(String(tick), tx, centerY + 13, "#94a3b8", "center", "500 10px ui-rounded, -apple-system");
+      label(String(tick), centerX - 5, ty + 3, "#94a3b8", "right", "500 10px ui-rounded, -apple-system");
+    }
+    const xMin = -width / 2 / scale, xMax = width / 2 / scale;
+    context.strokeStyle = "#2563eb"; context.lineWidth = 3; context.beginPath();
+    let penDown = false;
+    for (let px = 0; px <= width; px += 1.5) {
+      const x = xMin + px / width * (xMax - xMin), y = f(x);
+      if (!Number.isFinite(y) || Math.abs(y) > 1e4) { penDown = false; continue; }
+      const [sx, sy] = toScreen(x, y);
+      penDown ? context.lineTo(sx, sy) : context.moveTo(sx, sy); penDown = true;
+    }
+    context.stroke();
+    const roots = [], turningPoints = [];
+    const stepSize = 0.01;
+    for (let x = xMin; x < xMax; x += stepSize) {
+      const y1 = f(x), y2 = f(x + stepSize), y0 = f(x - stepSize);
+      if (Number.isFinite(y1) && Number.isFinite(y2) && (y1 === 0 || y1 * y2 < 0)) {
+        let low = x, high = x + stepSize;
+        for (let i = 0; i < 40; i++) { const mid = (low + high) / 2; f(low) * f(mid) <= 0 ? high = mid : low = mid; }
+        const root = (low + high) / 2;
+        if (!roots.some((r) => Math.abs(r - root) < 0.05)) roots.push(root);
+      }
+      if (Number.isFinite(y0) && Number.isFinite(y1) && Number.isFinite(y2) && (y1 - y0) * (y2 - y1) < 0 && turningPoints.length < 4) turningPoints.push([x, y1]);
+    }
+    roots.slice(0, 6).forEach((root) => { const [sx, sy] = toScreen(root, 0); circle(sx, sy, 6, "#ffffff", "#dc2626"); label(root.toFixed(2), sx, sy - 10, "#b91c1c"); });
+    turningPoints.forEach(([x, y]) => { const [sx, sy] = toScreen(x, y); circle(sx, sy, 6, "#7c3aed"); label(`(${x.toFixed(1)}, ${y.toFixed(1)})`, sx, sy + (y > 0 ? -12 : 20), "#6d28d9"); });
+    setReadouts([
+      { label: "x-intercepts", value: roots.length ? roots.slice(0, 4).map((r) => r.toFixed(2)).join(", ") : "none" },
+      { label: turningPoints.length === 1 ? "Vertex" : "Turning points", value: turningPoints.length ? turningPoints.slice(0, 2).map(([x, y]) => `(${x.toFixed(1)}, ${y.toFixed(1)})`).join(" ") : "none" },
+    ]);
+  };
+};
+
+simulations.circuit = () => {
+  addControl("voltage", { label: "Battery voltage", min: 0, max: 24, step: 0.5, value: 9, unit: "V", decimals: 1 });
+  addControl("resistance", { label: "Resistance", min: 1, max: 100, step: 1, value: 30, unit: "Ω" });
+  formulaElement.textContent = "I = V / R,   P = V · I";
+  let chargeOffset = 0;
+  return (dt) => {
+    const current = values.voltage / values.resistance, power = values.voltage * current;
+    chargeOffset += current * dt * 160;
+    clear();
+    const left = width * 0.14, right = width * 0.86, top = height * 0.2, bottom = height * 0.82;
+    const loop = [[left, bottom], [left, top], [right, top], [right, bottom], [left, bottom]];
+    const lengths = []; let total = 0;
+    for (let i = 0; i < 4; i++) { const segment = Math.hypot(loop[i + 1][0] - loop[i][0], loop[i + 1][1] - loop[i][1]); lengths.push(segment); total += segment; }
+    context.strokeStyle = "#475569"; context.lineWidth = 4; context.lineJoin = "round";
+    context.beginPath(); loop.forEach(([x, y], i) => i ? context.lineTo(x, y) : context.moveTo(x, y)); context.stroke();
+    // Battery on the left side.
+    const batteryY = (top + bottom) / 2;
+    context.fillStyle = "#fbfaf6"; context.fillRect(left - 22, batteryY - 26, 44, 52);
+    context.fillStyle = "#334155"; context.fillRect(left - 20, batteryY - 9, 40, 4); context.fillRect(left - 11, batteryY + 5, 22, 4);
+    label(values.voltage.toFixed(1) + " V", left + 30, batteryY + 4, "#334155", "left", "700 13px ui-rounded, -apple-system");
+    // Resistor zigzag on the top.
+    const resistorStart = width * 0.36, resistorEnd = width * 0.56;
+    context.fillStyle = "#fbfaf6"; context.fillRect(resistorStart, top - 12, resistorEnd - resistorStart, 24);
+    context.strokeStyle = "#b45309"; context.lineWidth = 3; context.beginPath(); context.moveTo(resistorStart, top);
+    for (let i = 1; i <= 8; i++) context.lineTo(resistorStart + (resistorEnd - resistorStart) * i / 8, top + (i % 2 ? -10 : 10) * (i === 8 ? 0 : 1));
+    context.lineTo(resistorEnd, top); context.stroke();
+    label(values.resistance.toFixed(0) + " Ω", (resistorStart + resistorEnd) / 2, top - 18, "#92400e", "center", "700 13px ui-rounded, -apple-system");
+    // Bulb on the right side with a glow for power.
+    const bulbX = right, bulbY = (top + bottom) / 2;
+    const brightness = Math.min(1, Math.log10(1 + power) / Math.log10(1 + 60));
+    const glow = context.createRadialGradient(bulbX, bulbY, 4, bulbX, bulbY, 26 + brightness * 60);
+    glow.addColorStop(0, `rgba(253,224,71,${0.15 + brightness * 0.85})`); glow.addColorStop(1, "rgba(253,224,71,0)");
+    context.fillStyle = glow; context.beginPath(); context.arc(bulbX, bulbY, 26 + brightness * 60, 0, Math.PI * 2); context.fill();
+    circle(bulbX, bulbY, 17, `rgb(${250}, ${250 - brightness * 40}, ${200 - brightness * 150})`, "#475569");
+    label("bulb", bulbX + 26, bulbY + 4, "#475569", "left");
+    // Moving charges around the loop (conventional current direction).
+    const spacing = 28;
+    for (let distance = (chargeOffset % spacing); distance < total; distance += spacing) {
+      let remaining = distance, segmentIndex = 0;
+      while (segmentIndex < 3 && remaining > lengths[segmentIndex]) { remaining -= lengths[segmentIndex]; segmentIndex++; }
+      const [x1, y1] = loop[segmentIndex], [x2, y2] = loop[segmentIndex + 1];
+      const t = remaining / lengths[segmentIndex];
+      circle(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t, 3.5, "#2563eb");
+    }
+    setReadouts([
+      { label: "Current", value: current.toFixed(2) + " A" },
+      { label: "Power", value: power.toFixed(1) + " W" },
+      { label: "Check", value: `${values.voltage.toFixed(1)} V ÷ ${values.resistance.toFixed(0)} Ω` },
+    ]);
+  };
+};
+
+simulations.orbit = () => {
+  addControl("star_mass", { label: "Star mass", min: 0.2, max: 3, step: 0.05, value: 1, unit: "suns", decimals: 2 });
+  addControl("distance", { label: "Starting distance", min: 0.5, max: 3, step: 0.05, value: 1, unit: "AU", decimals: 2 });
+  addControl("speed", { label: "Starting speed", min: 0.5, max: 1.6, step: 0.01, value: 1, unit: "× circular", decimals: 2 });
+  formulaElement.textContent = "T² = a³ / M";
+  let position, velocity;
+  const trail = [];
+  const reset = () => {
+    const gravitationalParameter = 4 * Math.PI * Math.PI * values.star_mass;
+    position = [values.distance, 0];
+    velocity = [0, values.speed * Math.sqrt(gravitationalParameter / values.distance)];
+    trail.length = 0;
+  };
+  let pendingReset = null;
+  onValuesChanged = (names, stillMoving) => { clearTimeout(pendingReset); pendingReset = setTimeout(reset, stillMoving ? 300 : 60); };
+  reset();
+  return (dt) => {
+    const gravitationalParameter = 4 * Math.PI * Math.PI * values.star_mass;
+    const yearsPerSecond = 0.25;
+    const substeps = 60, h = dt * yearsPerSecond / substeps;
+    for (let i = 0; i < substeps; i++) {
+      const r = Math.hypot(position[0], position[1]);
+      const acceleration = -gravitationalParameter / (r * r * r);
+      velocity[0] += acceleration * position[0] * h; velocity[1] += acceleration * position[1] * h;
+      position[0] += velocity[0] * h; position[1] += velocity[1] * h;
+    }
+    clear();
+    context.fillStyle = "#0f172a"; context.fillRect(0, 0, width, height);
+    for (let i = 0; i < 40; i++) circle((i * 97) % width, (i * 53) % height, 0.9, "rgba(255,255,255,0.5)");
+    const scale = Math.min(width, height) / 2 / 3.3;
+    const centerX = width / 2, centerY = height / 2;
+    const starRadius = 8 + values.star_mass * 5;
+    const glow = context.createRadialGradient(centerX, centerY, 2, centerX, centerY, starRadius * 2.4);
+    glow.addColorStop(0, "#fff7ae"); glow.addColorStop(0.4, "#fbbf24"); glow.addColorStop(1, "rgba(251,191,36,0)");
+    context.fillStyle = glow; context.beginPath(); context.arc(centerX, centerY, starRadius * 2.4, 0, Math.PI * 2); context.fill();
+    const screenX = centerX + position[0] * scale, screenY = centerY - position[1] * scale;
+    trail.push([screenX, screenY]); if (trail.length > 900) trail.shift();
+    context.strokeStyle = "rgba(96,165,250,0.7)"; context.lineWidth = 1.6;
+    context.beginPath(); trail.forEach(([x, y], i) => i ? context.lineTo(x, y) : context.moveTo(x, y)); context.stroke();
+    circle(screenX, screenY, 6, "#60a5fa");
+    const r = Math.hypot(position[0], position[1]);
+    const energy = (velocity[0] ** 2 + velocity[1] ** 2) / 2 - gravitationalParameter / r;
+    const items = [{ label: "Distance now", value: r.toFixed(2) + " AU" }];
+    if (energy < 0) {
+      const semiMajorAxis = -gravitationalParameter / (2 * energy);
+      items.push({ label: "Year length", value: Math.sqrt(semiMajorAxis ** 3 / values.star_mass).toFixed(2) + " Earth years" });
+    } else {
+      items.push({ label: "Orbit", value: "escaping the star!", alert: true });
+    }
+    setReadouts(items);
+    if (r > 12) reset();
+  };
+};
+
+simulations.custom = () => {
+  document.body.innerHTML = "<p>Missing simulation.</p>";
+  return () => {};
+};
+
+// ---------- Start ----------
+
+resizeCanvas();
+window.addEventListener("resize", resizeCanvas);
+const draw = (simulations[config.kind] || simulations.graph)();
+let lastFrameTime = performance.now();
+function tick() {
+  const now = performance.now();
+  const dt = Math.min(0.05, (now - lastFrameTime) / 1000);
+  if (dt < 0.008) return;
+  lastFrameTime = now;
+  advanceSliderMoves(now);
+  draw(dt);
+}
+function animationLoop() {
+  tick();
+  requestAnimationFrame(animationLoop);
+}
+requestAnimationFrame(animationLoop);
+// Animation frames pause when the window seems hidden; a timer keeps the lab running,
+// at 60 Hz so the demo video (60 fps) shows smooth motion.
+setInterval(() => { if (performance.now() - lastFrameTime > 20) tick(); }, 16);
+</script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+.DS_Store
+.build/
+build/
+dist/
+*.xcodeproj/xcuserdata/
+DerivedData/
+node_modules/
+brain/dist/
+.env
+.env.*
+*.local.json
